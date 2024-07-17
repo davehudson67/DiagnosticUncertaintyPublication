@@ -1,0 +1,207 @@
+---
+title: "Peril 2"
+author: "Dave Hudson"
+date: "2024-05-01"
+output:
+html_document:
+df_print: paged
+---
+
+# R Code for Peril 2: Alternatives to a 3rd test
+
+#### Load libaries and set wd.
+
+```{r setup, message = FALSE}
+library(nimble)
+library(MCMCvis)
+library(tidyverse)
+library(coda)
+
+setwd("~")
+```
+
+#### Setup test parameters
+
+#### Set sensitivities and specificities for two different tests and prevalences for two populations of 1000 individuals where the prevalence of the second population changes.
+
+```{r, message = FALSE}
+psens <- c(0.9, 0.9)
+pspec <- c(0.75, 0.75)
+npopns<-2
+
+# Define the range of second prevalence values
+prevalence_values <- seq(0.3, 0.5, by = 0.05)
+```
+
+#### Now we loop over the analysis for each of the different prevalence values for the second population and save the output.
+
+```{r, message = FALSE, results='hide'}
+# Loop through each prevalence value
+for (pprev2 in prevalence_values) {
+  pprev <- c(0.3, pprev2)  # First prevalence fixed at 0.3, second varies
+  nbadgers <- 1000
+  npopns <- length(pprev)  # Update number of populations based on prevalence vector length
+
+  # Simulate infection status of the badgers
+  inf <- array(0, dim = c(nbadgers, npopns))
+  for(p in 1:npopns){
+    inf[, p] <- rbinom(nbadgers, 1, pprev[p])
+  }
+  
+  # Set up empty array of test outcomes
+  tests <- array(0, dim = c(nbadgers, length(psens), npopns))
+  colnames(tests) <- c("test1", "test2")
+  
+  # Simulate test outcomes
+  for(p in 1:npopns){
+    for(i in 1:nbadgers){
+      for(j in 1:length(psens)){
+        tests[i, j, p] <- rbinom(1, 1, ifelse(inf[i, p] == 1, psens[j], 1 - pspec[j]))
+      }
+    }
+    
+    # Get table of frequencies
+    ntests <- 2
+    binop <- 2^seq(0, ntests-1)
+    testbin <- array(0, dim = c(nbadgers, npopns))
+    testcounts <- array(0, dim = c(2^ntests, npopns))
+    for(p in 1:npopns){
+      testbin[,p] <- tests[, 1:ntests, p] %*% binop
+      testcounts[,p] <- tabulate(testbin[,p] + 1, nbins = 2^ntests)
+    }
+    
+    # Create omega matrix of binary sequence
+    omega <- t(as.matrix(expand.grid(replicate(ntests, c(0, 1), simplify = FALSE))))
+    
+    ## Define parameters you want to report on
+    params <- c("pprev", "psens", "pspec")
+    
+    code  <- nimbleCode({
+      
+      for(p in 1:nP){
+        for(i in 1:n) {
+          pinf[i, p] <- pprev[p] * prod(omega[1:nT, i] * psens[1:nT] + (1 - omega[1:nT, i]) * (1 - psens[1:nT]))+
+            (1 - pprev[p]) * prod(omega[1:nT, i] * (1 - pspec[1:nT]) + (1 - omega[1:nT, i]) * (pspec[1:nT]))
+        }
+        Te[1:n, p] ~ dmulti(pinf[1:n, p], N)
+      }
+      
+      for(p in 1:npopns){ 
+        pprev[p] ~ dunif(0,1)
+      }
+      
+      for(j in 1:nT) {
+        psens[j] ~ dunif(0, 1)
+        pspec[j] ~ dunif(0, 1)
+      }
+      
+      
+    })
+    
+    consts <- list(n = 2^ntests,
+                   nT = ntests, N = nbadgers, omega=omega, nP = npopns)
+    
+    data <- list(
+      Te = testcounts)
+    
+    inits <- list(
+      pprev = runif(npopns, 0, 1),
+      psens = runif(ntests, 0.5, 1),
+      pspec = runif(ntests, 0.5, 1)
+    )
+    
+    model <- nimbleModel(code, constants = consts, data = data, inits = inits)
+    
+    cModel <- compileNimble(model)
+    
+    config <- configureMCMC(model)
+    
+    rMCMC <- buildMCMC(config)
+    
+    cMCMC <- compileNimble(rMCMC, project = model)
+    
+    system.time(run <- runMCMC(cMCMC, 
+                               niter = 50000, 
+                               nburnin = 2400, 
+                               nchains = 3, 
+                               progressBar = TRUE, 
+                               summary = TRUE, 
+                               samplesAsCodaMCMC = TRUE, 
+                               thin = 1))
+    
+    # Save the run
+    save_filename <- sprintf("run_%03d.rds", round(pprev2 * 100))
+    saveRDS(run, save_filename)
+  }
+}
+
+```
+
+#### Now load the results from all runs into the local environment
+
+```{r, message = FALSE}
+
+r50 <- readRDS("run_050.rds")
+r45 <- readRDS("run_045.rds")
+r40 <- readRDS("run_040.rds")
+r35 <- readRDS("run_035.rds")
+r30 <- readRDS("run_030.rds")
+```
+
+
+#### We now process the results getting ready to plot
+
+```{r, message = FALSE}
+
+# List of run objects and their respective second prevalence values
+runs <- list(r50 = 0.5, r45 = 0.45, r40 = 0.4, r35 = 0.35, r30 = 0.3)
+data_frames <- list()
+
+# Loop over each run and its associated prevalence value
+for (run in names(runs)) {
+  current_run <- get(run)  # using 'get' to retrieve the run object based on its name
+  
+  # Summarize and transform data
+  run_sum <- as.matrix(current_run$summary$all.chains[, 1])
+  run_samp <- as.matrix(current_run$samples)
+  
+  run_samp <- run_samp %>%
+    as.data.frame() %>%
+    rename(PrevalenceA = 1, PrevalenceB = 2, Sensitivity = 3, Sensitivity2 = 4, Specificity = 5, Specificity2 = 6) %>%
+    select(PrevalenceA, PrevalenceB, Sensitivity, Specificity) %>%
+    pivot_longer(cols = c(PrevalenceA, PrevalenceB, Sensitivity, Specificity), 
+                 values_to = "Estimate", names_to = "Inferred_parameter") %>%
+    mutate(Truth = rep(c(0.3, runs[[run]], 0.9, 0.75), times = 571200/4)) %>%
+    mutate(Mean = rep(run_sum[1:4], times = 571200/4)) %>%
+    mutate(PrevalenceB_truth = runs[[run]])
+  
+  # Store in list
+  data_frames[[run]] <- run_samp
+}
+
+# Combine all data frames into one final data frame
+data <- bind_rows(data_frames)
+
+```
+
+#### We can now do a bit of tidying and create the plot
+
+```{r, message = FALSE}
+
+ggplot(data, aes(x = Inferred_parameter, y = Estimate, fill = Inferred_parameter)) +
+  geom_violin(position = "dodge") +
+  geom_hline(aes(yintercept = Truth, colour = Inferred_parameter), linetype = 2) +
+  stat_summary(fun = "mean", geom = "point") +
+  facet_grid(~ PrevalenceB_truth) +
+  theme_bw() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), text = element_text(size = 15)) +
+  labs(x = "Prevalence Population B", fill = "Inferred parameter", colour = "Inferred parameter")
+
+```
+
+
+
+
+
+
+

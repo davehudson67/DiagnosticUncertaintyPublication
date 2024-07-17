@@ -1,0 +1,519 @@
+---
+title: "Peril 6"
+author: "Dave Hudson"
+date: "2024-05-01"
+output:
+html_document:
+df_print: paged
+---
+
+# R Code for Peril 6: Trade-offs between Sensitivity and Specificity
+
+#### Load libaries and wd.
+
+```{r setup, message = FALSE}
+library(nimble)
+library(MCMCvis)
+library(tidyverse)
+library(coda)
+library(patchwork)
+library(GGally)
+
+setwd("~")
+```
+
+#### Setup sensitivity and specificity vector, number of tests and number of simulations we want to run. we then setup a number of 3D arrays to store the results of the simulations.
+
+```{r, message=FALSE}
+
+## set up initial parameters, number of tests and iterations
+ntests <- 5
+psensvec <- c(0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95)
+pspecvec <- c(0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55)
+n_iterations <- 20
+
+## initialize a 3D array to store the summary statistics
+summaryinference_all <- array(0, dim = c(n_iterations, length(psensvec), 2 * ntests + 1))
+summaryinfsd_all <- array(0, dim = c(n_iterations, length(psensvec), 2 * ntests + 1))
+
+```
+
+#### We now run a series of loops, first over the number of simulations we want and then for each simulation we loop over the sensitivity vector. Please note that we use an informative prior on the prevalence to try and limit the number of simulations that return the flipped parameter solution (although this will likely not eliminate them) but leave uninformative priors on both sensitivity and specificity.
+
+```{r, message = FALSE, results='hide'}
+
+## Begin loop over iterations
+for(iter in 1:n_iterations) {
+  
+  # Initialize summaryinference and summaryinfsd inside the loop over iterations
+  summaryinference <- matrix(0, nrow = length(psensvec), ncol = 2 * ntests + 1)
+  summaryinfsd <- matrix(0, nrow = length(psensvec), ncol = 2 * ntests + 1)
+  
+  ## Begin loop over sensitivities
+  for(q in 1:length(psensvec)){
+    
+    psens <- c(psensvec[q], 0.8, 0.7, 0.65, 0.6)
+    pspec <- c(pspecvec[q], 0.75, 0.7, 0.65, 0.6)
+    pprev <- 0.3
+    nindividuals <- 1000
+    print(psens)
+    print(pspec)
+    print(pprev)
+    
+    #simulate infection status of the badgers
+    inf <- rbinom(nindividuals, 1, pprev)
+    
+    #set up empty array of test outcomes
+    tests <- array(0, dim = c(nindividuals, length(psens)))
+    colnames(tests) <- c("test1", "test2", "test3", "test4", "test5")
+    
+    #for each badger and each test, simulate test outcome
+    for(i in 1:length(inf)){
+      for(j in 1:length(psens)){
+        tests[i, j] <- rbinom(1, 1, ifelse(inf[i] == 1, psens[j], 1 - pspec[j]))}}
+    
+    ############manipulate test numbers from here###############
+    
+    #get table of frequencies
+    binop <- 2^seq(0, ntests - 1)
+    testbin <- tests[, 1:ntests] %*% binop
+    testcounts <- tabulate(testbin + 1, nbins = 2^ntests)
+    testcounts
+    
+    #create omega matrix of binary sequence
+    omega <- expand.grid(replicate(ntests, c(0, 1), simplify = FALSE))
+    omega <- as.matrix(omega)
+    omega <- t(omega)
+    
+    code  <- nimbleCode({
+      
+      for(i in 1:n) {
+        
+        pinf[i] <- pprev * prod(omega[1:nT, i] * psens[1:nT] + (1 - omega[1:nT, i]) * (1 - psens[1:nT])) +
+          (1 - pprev) * prod(omega[1:nT, i] * (1-pspec[1:nT]) + (1 - omega[1:nT, i]) * (pspec[1:nT]))
+      }
+      
+      for(k in 1:nT){
+        psens[k] ~ dunif(0, 1)
+        pspec[k] ~ dunif(0, 1)
+      }
+      
+      pprev ~ dunif(0, 0.5)
+      
+      Te[1:n] ~ dmulti(pinf[1:n], N)
+      
+    })
+    
+    consts <- list(n = length(testcounts),
+                   nT = ntests, N = sum(testcounts), omega = omega)
+    
+    data <- list(
+      Te = testcounts)
+    
+    inits <- list(
+      pprev = runif(1, 0, 0.5),
+      psens = runif(ntests, 0.5, 1),
+      pspec = runif(ntests, 0.5, 1)
+    )
+    
+    model <- nimbleModel(code, constants = consts, data = data, inits = inits)
+    
+    cModel <- compileNimble(model)
+    
+    config <- configureMCMC(model)
+    
+    
+    rMCMC <- buildMCMC(config)
+    
+    cMCMC <- compileNimble(rMCMC, project = model)
+    
+    system.time(run <- runMCMC(cMCMC, 
+                               niter = 10000, 
+                               nburnin = 2400, 
+                               nchains = 3, 
+                               progressBar = TRUE, 
+                               summary = TRUE, 
+                               samplesAsCodaMCMC = TRUE, 
+                               thin = 1))
+    
+    runsummary <- MCMCsummary(run$samples)
+    
+    summaryinference[q, ] <- runsummary$mean
+    summaryinfsd[q, ] <- runsummary$sd
+    
+  } # end loop over sensitivities
+  
+  summaryinference_all[iter, , ] <- summaryinference
+  summaryinfsd_all[iter, , ] <- summaryinfsd  
+  
+} # end loop over iterations
+
+## Save data
+saveRDS(summaryinference_all, "SummaryInference_ALL2.rds")
+saveRDS(summaryinfsd_all, "SummaryInfSD_ALL2.rds")
+
+## Save last run for Figure 9
+saveRDS(run, "FinalRunSamples2.rds")
+
+```
+
+#### We now load the results and process ready to plot.
+
+```{r, message = FALSE, results='hide'}
+
+summaryinference_all <- readRDS("SummaryInference_ALL2.rds")
+summaryinfsd_all <- readRDS("SummaryInfSD_ALL2.rds")
+
+# Create an empty data frame to hold the results
+plot_data <- data.frame(iteration = integer(),
+                        true_sens = double(),
+                        true_spec = double(),
+                        true_prev = double(),
+                        inferred_sens = double(),
+                        inferred_spec = double(),
+                        inferred_prev = double())
+
+# Loop through the 3D arrays to populate the data frame
+for (iter in 1:dim(summaryinference_all)[1]) {
+  for (q in 1:dim(summaryinference_all)[2]) {
+    true_sens = psensvec[q]
+    true_spec = pspecvec[q]
+    true_prev = 0.3
+    
+    # Replace x, y with the indices where inferred_sens and posterior_sd are stored
+    inferred_sens = summaryinference_all[iter, q, 2]
+    inferred_spec = summaryinference_all[iter, q, 7]
+    inferred_prev = summaryinference_all[iter, q, 1]
+
+    plot_data <- rbind(plot_data, data.frame(iteration = iter, true_sens = true_sens,  true_spec = true_spec,
+                                             true_prev = true_prev,
+                                             inferred_sens = inferred_sens, inferred_prev = inferred_prev,
+                                             inferred_spec = inferred_spec))
+  }
+}
+
+# Create an empty data frame to hold the results
+plot_dataSD <- data.frame(iteration = integer(),
+                        true_sens = double(),
+                        true_spec = double(),
+                        inferred_sensSD = double(),
+                        inferred_specSD = double(),
+                        inferred_prevSD = double())
+
+# Loop through the 3D arrays to populate the data frame
+for (iter in 1:dim(summaryinfsd_all)[1]) {
+  for (q in 1:dim(summaryinfsd_all)[2]) {
+    true_sens = psensvec[q]
+    true_spec = pspecvec[q]
+    
+    # inferred_sens and posterior_sd are stored
+    inferred_sensSD = summaryinfsd_all[iter, q, 2]
+    inferred_specSD = summaryinfsd_all[iter, q, 7]
+    inferred_prevSD = summaryinfsd_all[iter, q, 1]
+    
+    plot_dataSD <- rbind(plot_dataSD, data.frame(iteration = iter, true_sens = true_sens,  true_spec = true_spec,
+                                             inferred_sensSD = inferred_sensSD, inferred_prevSD = inferred_prevSD,
+                                             inferred_specSD = inferred_specSD))
+  }
+}
+
+```
+
+#### Now prepare each panel plot.
+
+```{r, message = FALSE}
+
+# Asd - Within sample imprecision
+aSD <- plot_dataSD %>%
+  group_by(true_sens) %>%
+  mutate(Asd = inferred_sensSD) %>%
+  ungroup() %>%
+  ggplot(aes(x = true_sens, y = Asd)) +
+  geom_point(alpha = 0.2) +
+  xlab("") +
+  ylab("Within sample imprecision") +
+  theme_bw() +
+  theme(text = element_text(size = 13),
+        axis.title.y = element_text(size = 10))
+
+# Bsd - Within sample imprecision
+bSD <- plot_dataSD %>%
+  group_by(true_sens) %>%
+  mutate(Asd = inferred_specSD) %>%
+  ungroup() %>%
+  ggplot(aes(x = true_sens, y = Asd)) +
+  geom_point(alpha = 0.2) +
+  xlab("") +
+  ylab("Within sample imprecision") +
+  theme_bw() +
+  theme(text = element_text(size = 13),
+        axis.title.y = element_text(size = 10))
+  
+# Csd - Within sample imprecision
+cSD <- plot_dataSD %>%
+  group_by(true_sens) %>%
+  mutate(Asd = inferred_prevSD) %>%
+  ungroup() %>%
+  ggplot(aes(x = true_sens, y = Asd)) +
+  geom_point(alpha = 0.2) +
+  xlab("") +
+  ylab("Within sample imprecision") +
+  theme_bw() +
+  theme(text = element_text(size = 13),
+        axis.title.y = element_text(size = 10))
+
+# A - Sensitivity
+a <- ggplot(plot_data, aes(x = true_sens, y = inferred_sens)) +
+  geom_point(alpha = 0.2) +
+  xlab("") +
+  ylab("Sensitivity") +
+  geom_abline(slope = 1,
+              intercept = 0,
+              color="blue") +
+  theme_bw() +
+  theme(text = element_text(size = 13))
+
+# B - Specificity
+b <- ggplot(plot_data, aes(x = true_sens, y = inferred_spec)) +
+  geom_point(alpha = 0.2) +
+  xlab("") +
+  ylab("Specificity") +
+  geom_abline(slope = -1,
+              intercept = 1.5,
+              color="blue")  +
+  theme_bw() +
+  theme(text = element_text(size = 13))
+
+# C - Prevalence
+c <- ggplot(plot_data, aes(x = true_sens, y = inferred_prev)) +
+  geom_point(alpha = 0.2) +
+  xlab("") +
+  ylab("Prevalence") +
+  geom_hline(yintercept = 0.3,
+              color="blue") +
+  theme_bw() +
+  theme(text = element_text(size = 13))
+  
+## Prepare data
+plot_data1 <- plot_data %>%
+  group_by(true_sens) %>%
+  mutate(DiffSens = inferred_sens - true_sens) %>%
+  mutate(DiffSpec = inferred_spec - true_spec) %>%
+  mutate(DiffPrev = inferred_prev - 0.3)
+
+# A1 - Within sample inaccuracy
+a1 <- ggplot(plot_data1, aes(x = true_sens, y = DiffSens)) +
+  geom_point(alpha = 0.2) +
+  xlab("") +
+  ylab("Within sample inaccuracy") +
+  geom_abline(slope = 0,
+              intercept = 0,
+              color="black") +
+  theme_bw() +
+  theme(text = element_text(size = 13),
+        axis.title.y = element_text(size = 10))
+
+# B1 - Within sample inaccuracy
+b1 <- ggplot(plot_data1, aes(x = true_sens, y = DiffSpec)) +
+  geom_point(alpha = 0.2) +
+  xlab("") +
+  ylab("Within sample inaccuracy") +
+  geom_abline(slope = 0,
+              intercept = 0,
+              color="black") +
+  theme_bw() +
+  theme(text = element_text(size = 13),
+        axis.title.y = element_text(size = 10))
+  
+# C1 - Within sample inaccuracy
+c1 <- ggplot(plot_data1, aes(x = true_sens, y = DiffPrev)) +
+  geom_point(alpha = 0.2) +
+  xlab("") +
+  ylab("Within sample inaccuracy") +
+  geom_abline(slope = 0,
+              intercept = 0,
+              color="black") +
+  theme_bw() +
+  theme(text = element_text(size = 13),
+        axis.title.y = element_text(size = 10))
+
+```
+
+#### And finally generate the final plot.
+
+```{r, message=FALSE}
+
+Fig7 <- (a/b/c)|(a1/b1/c1)|(aSD/bSD/cSD)
+
+wrap_elements(panel = Fig7) +
+  labs(tag = "True Sensitivity") +
+  theme(
+    plot.tag = element_text(size = 13),
+    plot.tag.position = "bottom"
+  )
+
+```
+
+#### We now move to Figure 8: Associations among diagnostic parameters inferred from replicated simulations of diagnostic testing regimes.
+
+#### First set test sensitivities and specificities for three different tests and prevalence for a single population of 1000 individuals.
+
+```{r, message=FALSE}
+
+psens <- c(0.85, 0.8, 0.7)
+pspec <- c(0.70, 0.85, 0.75)
+pprev <- 0.3
+nindividuals <- 1000
+true_values <- c(pprev, psens[1], pspec[1])
+true_parameter <- c("Prevalence", "Sensitivity", "Specificity")
+truth <- data.frame(true_parameter, true_values)
+```
+
+#### Now set the number of simulations we want to run and the number of tests.
+
+```{r}
+n_iterations <- 30
+ntests <- 3
+```
+
+#### We then set an array to store the results before strating the run. Please note that again we use an informative prior on prevalence but not on sensitivty and specificity.
+
+```{r, message=FALSE, results='hide'}
+
+# Initialize summary inference
+summaryinfMean <- matrix(0, nrow = n_iterations, ncol = 2 * ntests + 1)
+
+## Begin loop over iterations
+for(iter in 1:n_iterations) {
+  
+  #simulate infection status of the badgers
+  inf <- rbinom(nindividuals, 1, pprev)
+
+  #set up empty array of test outcomes
+  tests <- array(0, dim = c(nindividuals, length(psens)))
+  colnames(tests) <- c("test1", "test2", "test3")
+  
+  #for each badger and each test, simulate test outcome
+  for(i in 1:length(inf)){
+    for(j in 1:length(psens)){
+      tests[i, j] <- rbinom(1, 1, ifelse(inf[i] == 1, psens[j], 1-pspec[j]))}}
+  
+  #get table of frequencies
+  binop <- 2^seq(0, ntests-1)
+  testbin <- tests[, 1:ntests] %*% binop
+  testcounts <- tabulate(testbin + 1, nbins = 2^ntests)
+  testcounts
+  
+  #create omega matrix of binary sequence
+  omega <- expand.grid(replicate(ntests, c(0, 1), simplify = FALSE))
+  omega <- as.matrix(omega)
+  omega <- t(omega)
+  
+  ## Define parameters you want to report on
+  params <- c("pprev", "psens", "pspec")
+  
+  code  <- nimbleCode({
+    
+    for(i in 1:n) {
+      pinf[i] <- pprev * prod(omega[1:nT, i] * psens[1:nT] + (1 - omega[1:nT, i]) * (1 - psens[1:nT])) +
+        (1 - pprev) * prod(omega[1:nT, i] * (1 - pspec[1:nT]) + (1 - omega[1:nT, i]) * (pspec[1:nT]))
+    }
+    
+    Te[1:n] ~ dmulti(pinf[1:n], N)
+    
+    
+    pprev ~ dunif(0, 0.5)
+    
+    for(j in 1:nT) {
+      psens[j] ~ dunif(0, 1)
+      pspec[j] ~ dunif(0, 1)
+    }
+    
+  })
+  
+  consts <- list(n = length(testcounts),
+                 nT = ntests, N = sum(testcounts), omega = omega)
+  
+  data <- list(
+    Te = testcounts)
+  
+  inits <- list(
+    pprev = runif(1, 0, 0.5),
+    psens = runif(ntests, 0.5, 1),
+    pspec = runif(ntests, 0.5, 1)
+  )
+  
+  model <- nimbleModel(code, constants = consts, data = data, inits = inits)
+  
+  cModel <- compileNimble(model)
+  
+  config <- configureMCMC(model)
+  
+  rMCMC <- buildMCMC(config)
+  
+  cMCMC <- compileNimble(rMCMC, project = model)
+  
+  system.time(run <- runMCMC(cMCMC, 
+                             niter = 80000, 
+                             nburnin = 12000, 
+                             nchains = 3, 
+                             progressBar = TRUE, 
+                             summary = TRUE, 
+                             samplesAsCodaMCMC = TRUE, 
+                             thin = 1))
+  
+  runsummary <- MCMCsummary(run$samples)
+  
+  summaryinfMean[iter, ] <- runsummary$mean
+  
+  } # end loop over sensitivities
+
+saveRDS(summaryinfMean, "SummaryInfMean2.rds")
+
+```
+
+#### We now load the results, adjust column names and plot.
+
+```{r, message = FALSE}
+
+summaryinfMean <- as.data.frame(readRDS("SummaryInfMean2.rds"))
+colnames(summaryinfMean) <- c("Prev", "Se1", "Se2", "Se3", "Sp1", "Sp2", "Sp3")
+
+# fig 8
+ggpairs(summaryinfMean, aes(alpha = 0.2)) +
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(text = element_text(size = 15), axis.text.x = element_text(size = 8), axis.text.y = element_text(size = 8))
+
+```
+
+#### Now for Figure 9 - first we load the output we saved earlier and do some tidying.
+
+```{r, message=FALSE}
+
+## Pairs plot
+run <- readRDS("FinalRunSamples.rds")
+
+rundf <- as.matrix(run$samples, chain = TRUE) %>%
+  as.data.frame() %>%
+  mutate(CHAIN = as.factor(CHAIN))
+```
+
+#### We then thin the samples out to reduce overplotting.
+
+```{r, message=FALSE}
+# thin samples
+rundf_filtered <- rundf[seq(1, nrow(rundf), 200), ]
+colnames(rundf_filtered) <- c("CHAIN", "Prev", "Se1", "Se2", "Se3", "Sp1", "Sp2", "Sp3")
+```
+
+#### And then plot.
+
+```{r, message=FALSE}
+
+# fig 9
+ggpairs(rundf_filtered, columns = 2:8, aes(colour = CHAIN, alpha = 0.1)) + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(text = element_text(size = 15), axis.text.x = element_text(size = 8), axis.text.y = element_text(size = 8)) +
+  theme(axis.ticks = element_blank())
+```
